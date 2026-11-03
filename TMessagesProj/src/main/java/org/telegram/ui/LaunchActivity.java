@@ -7091,6 +7091,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
 
     @Override
     protected void onResume() {
+        org.telegram.messenger.AndroidUtilities.runOnUIThread(() -> org.telegram.messenger.ClaudUpdater.check(this,false),3000);
         getWindow().getDecorView().post(() -> { if (!isFinishing()) refreshClaudPet(); });
         org.telegram.messenger.plugins.PythonPlugins.call(this, "dispatch", null, "app_resumed", "");
         super.onResume();
