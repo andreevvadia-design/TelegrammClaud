@@ -1,0 +1,798 @@
+import math
+from typing import Any, List
+
+from android.animation import Animator, AnimatorSet, ObjectAnimator
+from android.graphics import Path
+from android.graphics.drawable import GradientDrawable
+from android.os import Build
+from android.util import TypedValue
+from android.view import Gravity, View, ViewGroup, ViewTreeObserver
+from android.view.animation import PathInterpolator
+from android.widget import FrameLayout, LinearLayout, TextView
+from androidx.recyclerview.widget import RecyclerView
+from java import dynamic_proxy, jclass
+from org.telegram.messenger import AndroidUtilities, MessagesController
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Components import CubicBezierInterpolator
+
+from android_utils import OnClickListener, run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from ui.settings import Custom, Divider, Header, Selector, SimpleSettingFactory, Switch
+
+try:
+    from org.telegram.ui.Cells import ChatMessageCell
+except Exception:
+    ChatMessageCell = None
+
+__id__ = "message_motion"
+__name__ = "Message Motion"
+__description__ = "плавные анимации появления сообщений: новых, при открытии чата и при прокрутке"
+__author__ = "@mishabotov"
+__version__ = "1.0"
+__icon__ = "AnimatedEmojies/196"
+
+OFF, POP, SMOOTH, SLIDE, FADE = range(5)
+STYLES = ["без эффекта", "пружинка", "плавно", "выезд сбоку", "растворение"]
+SPEEDS = ["быстро", "обычно", "медленно"]
+FACTORS = (0.75, 1.0, 1.35)
+DEFAULTS = {"in": (POP, 1), "out": (POP, 1), "scroll": (SMOOTH, 0)}
+
+SPRING_DAMPING = 0.55
+SPRING_DECAY = 6.2
+SPRING_POINTS = 64
+
+IDLE = 0
+
+CASCADE_LIMIT = 12
+CASCADE_STEP_MS = 35
+CASCADE_TIMEOUT_MS = 1200
+DEMO_DELAY_MS = 200
+DEMO_GAP_MS = 380
+
+ANIMATOR_CLASSES = (
+    "org.telegram.ui.recyclerview.ChatListItemAnimator",
+    "androidx.recyclerview.widget.ChatListItemAnimator",
+)
+ENTER_VIEW_CLASS = "org.telegram.ui.Components.ChatActivityEnterView"
+CHAT_CLASS = "org.telegram.ui.ChatActivity"
+HOLDER = "$ViewHolder"
+
+PROPS = {
+    "scale_x": (View.SCALE_X, "setScaleX"),
+    "scale_y": (View.SCALE_Y, "setScaleY"),
+    "alpha": (View.ALPHA, "setAlpha"),
+    "offset": ("animationOffsetX", "setAnimationOffsetX"),
+    "shift": (View.TRANSLATION_X, "setTranslationX"),
+}
+
+
+def spring() -> PathInterpolator:
+    omega = SPRING_DECAY / SPRING_DAMPING
+    damped = omega * math.sqrt(1.0 - SPRING_DAMPING * SPRING_DAMPING)
+    ratio = SPRING_DAMPING * omega / damped
+    path = Path()
+    path.moveTo(0.0, 0.0)
+    for i in range(1, SPRING_POINTS):
+        t = i / SPRING_POINTS
+        decay = math.exp(-SPRING_DAMPING * omega * t)
+        path.lineTo(t, 1.0 - decay * (math.cos(damped * t) + ratio * math.sin(damped * t)))
+    path.lineTo(1.0, 1.0)
+    return PathInterpolator(path)
+
+
+def side(out: bool) -> str:
+    return "out" if out else "in"
+
+
+def is_cell(view) -> bool:
+    return ChatMessageCell is not None and isinstance(view, ChatMessageCell)
+
+
+def settle(view):
+    view.setAlpha(1.0)
+    view.setScaleX(1.0)
+    view.setScaleY(1.0)
+    if is_cell(view):
+        view.setAnimationOffsetX(0.0)
+    else:
+        view.setTranslationX(0.0)
+    if Build.VERSION.SDK_INT >= 28:
+        view.resetPivot()
+
+
+def animations_on() -> bool:
+    try:
+        return bool(MessagesController.getGlobalMainSettings().getBoolean("view_animations", True))
+    except Exception:
+        return True
+
+
+class MessageMotionPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.alive = False
+        self.mode = None
+        self.native = False
+        self.live = {}
+        self.waiters = []
+        self.trackers = []
+        self.unhooks = []
+        self.factories = []
+        self.bubbles = None
+        self.spring = None
+        self.hooked = False
+
+    def on_plugin_load(self):
+        self.alive = True
+        self.spring = spring()
+        self.migrate()
+        for name in ANIMATOR_CLASSES:
+            animator = self.lookup(name)
+            if animator is not None and self.adopt(animator):
+                break
+        if not self.hooked:
+            self.log("аниматор чата пока не найден, поищу при открытии чата")
+        enter_view = self.lookup(ENTER_VIEW_CLASS)
+        if enter_view is not None:
+            self.attach(enter_view, "canShowMessageTransition", (), AfterHook(self, self.swap))
+        chat = self.lookup(CHAT_CLASS)
+        if chat is not None:
+            self.attach(chat, "onTransitionAnimationStart", ("boolean", "boolean"), AfterHook(self, self.opened))
+            self.attach(chat, "onFragmentDestroy", (), AfterHook(self, self.closed))
+
+    def on_plugin_unload(self):
+        self.alive = False
+        self.hooked = False
+        for unhook in self.unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self.unhooks = []
+        run_on_ui_thread(self.teardown)
+
+    def teardown(self):
+        for waiter in list(self.waiters):
+            self.disarm(waiter)
+        for tracker in list(self.trackers):
+            self.untrack(tracker)
+        self.stop_all()
+        self.bubbles = None
+        self.factories = []
+
+    def migrate(self):
+        for key in ("in_style", "out_style"):
+            try:
+                if int(self.get_setting(key, POP)) >= len(STYLES):
+                    self.set_setting(key, FADE)
+            except Exception:
+                self.set_setting(key, POP)
+
+    @staticmethod
+    def lookup(name: str):
+        try:
+            return jclass(name).getClass()
+        except Exception:
+            return None
+
+    def adopt(self, cls) -> bool:
+        while cls is not None and not self.hooked:
+            if self.declares(cls, "animateAddImpl", (HOLDER, "int")):
+                if self.attach(cls, "animateAddImpl", (HOLDER, "int"), AddHook(self)):
+                    self.hooked = True
+                    self.attach(cls, "endAnimation", (HOLDER,), AfterHook(self, self.resume_holder))
+                    self.attach(cls, "endAnimations", (), AfterHook(self, self.resume_all))
+                break
+            cls = cls.getSuperclass()
+        return self.hooked
+
+    @staticmethod
+    def fits(method, name: str, types) -> bool:
+        if method.getName() != name:
+            return False
+        actual = [str(p.getName()) for p in method.getParameterTypes()]
+        if len(actual) != len(types):
+            return False
+        return all(a == t or (t == HOLDER and a.endswith(HOLDER)) for a, t in zip(actual, types))
+
+    def declares(self, cls, name: str, types) -> bool:
+        try:
+            return any(self.fits(method, name, types) for method in list(cls.getDeclaredMethods()))
+        except Exception:
+            return False
+
+    def attach(self, cls, name: str, types, hook) -> bool:
+        try:
+            for method in list(cls.getDeclaredMethods()):
+                if not self.fits(method, name, types):
+                    continue
+                method.setAccessible(True)
+                self.unhooks.append(self.hook_method(method, hook))
+                return True
+            self.log(f"Метод {name}{tuple(types)} не найден")
+        except Exception as error:
+            self.log(f"Не удалось поставить хук {name}: {error}")
+        return False
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="входящие"),
+            Selector(
+                key="in_style",
+                text="эффект",
+                default=POP,
+                items=STYLES,
+                icon="msg_message",
+                on_change=self.changed,
+            ),
+            Selector(
+                key="in_speed",
+                text="скорость",
+                default=1,
+                items=SPEEDS,
+                icon="msg_speed",
+                on_change=self.changed,
+            ),
+            Header(text="мои сообщения"),
+            Selector(
+                key="out_style",
+                text="эффект",
+                default=POP,
+                items=STYLES,
+                icon="msg_send",
+                on_change=self.changed,
+            ),
+            Selector(
+                key="out_speed",
+                text="скорость",
+                default=1,
+                items=SPEEDS,
+                icon="msg_speed",
+                on_change=self.changed,
+            ),
+            Header(text="открытие чата"),
+            Switch(
+                key="cascade",
+                text="волна при открытии",
+                default=True,
+                subtext="сообщения появляются по очереди снизу вверх",
+                icon="msg_discussion",
+            ),
+            Header(text="прокрутка"),
+            Selector(
+                key="scroll_style",
+                text="эффект",
+                default=SMOOTH,
+                items=STYLES,
+                icon="msg_go_up",
+                on_change=self.rescrolled,
+            ),
+            Selector(
+                key="scroll_speed",
+                text="скорость",
+                default=0,
+                items=SPEEDS,
+                icon="msg_speed",
+                on_change=self.rescrolled,
+            ),
+            Header(text="как это выглядит"),
+            self.preview(),
+            Divider(
+                "голосовые и стикеры летят как обычно"
+            ),
+        ]
+
+    def changed(self, _value=None):
+        run_on_ui_thread(self.demo, 60)
+
+    def rescrolled(self, _value=None):
+        run_on_ui_thread(lambda: self.demo("scroll"), 60)
+
+    def preview(self):
+        plugin = self
+
+        def create_view(context, list_view, account, guid, provider):
+            return plugin.build(context, provider)
+
+        def bind_view(view, item, divider, adapter, list_view):
+            run_on_ui_thread(plugin.demo, DEMO_DELAY_MS)
+
+        factory = SimpleSettingFactory(create_view, bind_view, is_clickable=False, is_shadow=False)
+        self.factories.append(factory)
+        return Custom(factory=factory.instance.java)
+
+    def build(self, context, provider):
+        dp = AndroidUtilities.dp
+
+        def color(key):
+            return Theme.getColor(key, provider) if provider is not None else Theme.getColor(key)
+
+        wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+        match = ViewGroup.LayoutParams.MATCH_PARENT
+
+        root = LinearLayout(context)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(16), dp(10), dp(16), dp(12))
+        root.setBackgroundColor(color(Theme.key_windowBackgroundWhite))
+        root.setLayoutParams(ViewGroup.LayoutParams(match, wrap))
+
+        stage = FrameLayout(context)
+        backdrop = GradientDrawable()
+        backdrop.setCornerRadius(float(dp(14)))
+        backdrop.setColor(color(Theme.key_windowBackgroundGray))
+        stage.setBackground(backdrop)
+        stage.setPadding(dp(12), dp(12), dp(12), dp(12))
+        stage.setMinimumHeight(dp(112))
+        stage.setClipChildren(False)
+        stage.setClipToPadding(False)
+
+        incoming = self.bubble(
+            context,
+            "привет! как тебе анимация?",
+            color(Theme.key_chat_inBubble),
+            color(Theme.key_chat_messageTextIn),
+            False,
+        )
+        outgoing = self.bubble(
+            context,
+            "очень плавно ✨",
+            color(Theme.key_chat_outBubble),
+            color(Theme.key_chat_messageTextOut),
+            True,
+        )
+        stage.addView(incoming, FrameLayout.LayoutParams(wrap, wrap, Gravity.TOP | Gravity.LEFT))
+        params = FrameLayout.LayoutParams(wrap, wrap, Gravity.TOP | Gravity.RIGHT)
+        params.topMargin = dp(48)
+        stage.addView(outgoing, params)
+        stage.setOnClickListener(OnClickListener(lambda *_: self.demo()))
+        root.addView(stage, LinearLayout.LayoutParams(match, wrap))
+
+        hint = TextView(context)
+        hint.setText("нажми, чтобы посмотреть ещё раз")
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.0)
+        hint.setTextColor(color(Theme.key_windowBackgroundWhiteGrayText2))
+        hint.setPadding(dp(4), dp(8), dp(4), 0)
+        root.addView(hint, LinearLayout.LayoutParams(match, wrap))
+
+        self.bubbles = (incoming, outgoing)
+        return root
+
+    @staticmethod
+    def bubble(context, text: str, fill: int, ink: int, out: bool):
+        dp = AndroidUtilities.dp
+        view = TextView(context)
+        view.setText(text)
+        view.setTextColor(ink)
+        view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15.0)
+        view.setMaxWidth(dp(250))
+        view.setPadding(dp(12), dp(8), dp(12), dp(8))
+        big = float(dp(17))
+        small = float(dp(5))
+        if out:
+            radii = [big, big, big, big, small, small, big, big]
+        else:
+            radii = [big, big, big, big, big, big, small, small]
+        shape = GradientDrawable()
+        shape.setColor(fill)
+        shape.setCornerRadii(radii)
+        view.setBackground(shape)
+        return view
+
+    def demo(self, prefix=None):
+        bubbles = self.bubbles
+        if not self.alive or bubbles is None:
+            return
+        incoming, outgoing = bubbles
+        if not incoming.isAttachedToWindow():
+            return
+        style, speed = self.style(prefix or side(False))
+        self.play(incoming, style, speed, 0, False)
+        style, speed = self.style(prefix or side(True))
+        self.play(outgoing, style, speed, DEMO_GAP_MS, True)
+
+    def style(self, prefix: str):
+        style, speed = DEFAULTS[prefix]
+        style = int(self.get_setting(f"{prefix}_style", style))
+        if not 0 <= style < len(STYLES):
+            style = FADE
+        speed = int(self.get_setting(f"{prefix}_speed", speed))
+        return style, speed
+
+    @staticmethod
+    def message(view):
+        if not is_cell(view):
+            return None
+        return view.getMessageObject()
+
+    def prepare(self, param):
+        self.mode = None
+        self.native = False
+        message = self.message(param.args[0].itemView)
+        if message is None or not message.isOutOwner():
+            return
+        if message.isVoice():
+            self.mode = "voice"
+        elif int(self.get_setting("out_style", POP)) != OFF:
+            self.mode = "swap"
+
+    def swap(self, param):
+        if self.mode is None or not param.getResult():
+            return
+        if self.mode == "voice":
+            self.native = True
+            return
+        param.thisObject.startMessageTransition()
+        param.setResult(False)
+
+    def entered(self, param):
+        native = self.native
+        self.mode = None
+        self.native = False
+        if native:
+            return
+        view = param.args[0].itemView
+        message = self.message(view)
+        if message is None:
+            return
+        out = bool(message.isOutOwner())
+        style, speed = self.style(side(out))
+        self.play(view, style, speed, 0, out)
+
+    def opened(self, param):
+        if not param.args[0] or param.args[1]:
+            return
+        list_view = param.thisObject.getChatListView()
+        if list_view is None:
+            return
+        if not self.hooked:
+            animator = list_view.getItemAnimator()
+            if animator is not None and self.adopt(animator.getClass()):
+                self.log(f"аниматор найден: {animator.getClass().getName()}")
+        self.track(param.thisObject, list_view)
+        if not self.get_setting("cascade", True) or not animations_on():
+            return
+        waiter = Waiter(self, list_view)
+        list_view.getViewTreeObserver().addOnPreDrawListener(waiter)
+        self.waiters.append(waiter)
+        run_on_ui_thread(lambda: self.disarm(waiter), CASCADE_TIMEOUT_MS)
+
+    def disarm(self, waiter):
+        self.waiters = [w for w in self.waiters if w is not waiter]
+        list_view = waiter.list_view
+        waiter.list_view = None
+        if list_view is None:
+            return
+        try:
+            observer = list_view.getViewTreeObserver()
+            if observer.isAlive():
+                observer.removeOnPreDrawListener(waiter)
+        except Exception:
+            pass
+
+    def track(self, chat, list_view):
+        if any(tracker.chat == chat for tracker in self.trackers):
+            return
+        tracker = Tracker(self, chat, list_view)
+        list_view.addOnChildAttachStateChangeListener(tracker)
+        self.trackers.append(tracker)
+
+    def untrack(self, tracker):
+        self.trackers = [t for t in self.trackers if t is not tracker]
+        tracker.disarm()
+        tracker.pending.clear()
+        try:
+            tracker.list_view.removeOnChildAttachStateChangeListener(tracker)
+        except Exception:
+            pass
+
+    def closed(self, param):
+        chat = param.thisObject
+        for tracker in [t for t in self.trackers if t.chat == chat]:
+            self.untrack(tracker)
+
+    def spotted(self, tracker, view):
+        if not is_cell(view) or tracker.list_view.getScrollState() == IDLE:
+            return
+        if self.style("scroll")[0] == OFF or not animations_on():
+            return
+        tracker.pending[view] = True
+        tracker.arm()
+
+    def reveal(self, tracker):
+        list_view = tracker.list_view
+        height = list_view.getHeight()
+        idle = list_view.getScrollState() == IDLE
+        style, speed = self.style("scroll")
+        for view in list(tracker.pending):
+            if view.getBottom() > 0 and view.getTop() < height:
+                del tracker.pending[view]
+                message = view.getMessageObject()
+                if message is not None:
+                    self.play(view, style, speed, 0, bool(message.isOutOwner()))
+            elif idle:
+                del tracker.pending[view]
+        if not tracker.pending:
+            tracker.disarm()
+
+    def cascade(self, list_view) -> bool:
+        height = list_view.getHeight()
+        cells = []
+        for i in range(list_view.getChildCount()):
+            child = list_view.getChildAt(i)
+            if not is_cell(child) or child.getVisibility() != View.VISIBLE:
+                continue
+            if child.getBottom() <= 0 or child.getTop() >= height:
+                continue
+            message = child.getMessageObject()
+            if message is not None:
+                cells.append((int(child.getBottom()), child, bool(message.isOutOwner())))
+        if not cells:
+            return False
+        cells.sort(key=lambda item: item[0], reverse=True)
+        for index, (_, child, out) in enumerate(cells[:CASCADE_LIMIT]):
+            style, speed = self.style(side(out))
+            self.play(child, style, speed, index * CASCADE_STEP_MS, out)
+        return True
+
+    def play(self, view, style: int, speed: int, delay: int, out: bool):
+        self.stop(view)
+        if style == OFF or not self.alive:
+            return
+        cell = is_cell(view)
+        height = view.getHeight()
+        if cell:
+            if view.getTransitionParams().ignoreAlpha:
+                return
+            if view.getCurrentMessagesGroup() is not None:
+                style = FADE
+            left = view.getBackgroundDrawableLeft()
+            right = view.getBackgroundDrawableRight()
+            bottom = view.getBackgroundDrawableBottom()
+            middle = bool(view.drawBackgroundInParent())
+        else:
+            left, right, bottom, middle = 0, view.getWidth(), height, False
+        if right <= left:
+            left, right = 0, view.getWidth()
+        width = max(1, right - left)
+        pivot_y = float(height / 2.0 if middle or bottom <= 0 else bottom)
+        factor = FACTORS[speed] if 0 <= speed < len(FACTORS) else 1.0
+        ease = CubicBezierInterpolator.EASE_OUT
+        quint = CubicBezierInterpolator.EASE_OUT_QUINT
+
+        if style == POP:
+            view.setPivotX(float(right if out else left))
+            view.setPivotY(pivot_y)
+            tracks = [
+                ("scale_x", 0.55, 1.0, 420, self.spring),
+                ("scale_y", 0.55, 1.0, 420, self.spring),
+                ("alpha", 0.0, 1.0, 160, ease),
+            ]
+        elif style == SMOOTH:
+            view.setPivotX(float(left + width / 2.0))
+            view.setPivotY(pivot_y)
+            tracks = [
+                ("scale_x", 0.92, 1.0, 320, quint),
+                ("scale_y", 0.92, 1.0, 320, quint),
+                ("alpha", 0.0, 1.0, 240, ease),
+            ]
+        elif style == SLIDE:
+            shift = min(float(AndroidUtilities.dp(48)), width * 0.35)
+            tracks = [
+                ("offset" if cell else "shift", shift if out else -shift, 0.0, 340, quint),
+                ("alpha", 0.0, 1.0, 200, ease),
+            ]
+        else:
+            tracks = [("alpha", 0.0, 1.0, 260, ease)]
+
+        animators = []
+        for name, start, end, duration, interpolator in tracks:
+            prop, setter = PROPS[name]
+            getattr(view, setter)(float(start))
+            animator = ObjectAnimator.ofFloat(view, prop, float(start), float(end))
+            animator.setDuration(int(duration * factor))
+            animator.setInterpolator(interpolator)
+            animators.append((setter, animator, float(start)))
+
+        group = AnimatorSet()
+        group.playTogether(*[animator for _, animator, _ in animators])
+        group.setStartDelay(int(delay))
+        done = Finish(self, view)
+        group.addListener(done)
+        self.live[view] = (group, animators, done)
+        group.start()
+
+    def stop(self, view):
+        entry = self.live.pop(view, None)
+        if entry is None:
+            return
+        group, _, done = entry
+        done.done = True
+        try:
+            group.cancel()
+        finally:
+            settle(view)
+
+    def stop_all(self):
+        for view in list(self.live.keys()):
+            try:
+                self.stop(view)
+            except Exception as error:
+                self.log(f"Не удалось остановить анимацию: {error}")
+
+    def finish(self, view, done):
+        entry = self.live.get(view)
+        if entry is None or entry[2] is not done:
+            return
+        del self.live[view]
+        settle(view)
+
+    def resume(self, view):
+        entry = self.live.get(view)
+        if entry is None:
+            return
+        if view.getParent() is None:
+            self.stop(view)
+            return
+        for setter, animator, start in entry[1]:
+            value = animator.getAnimatedValue()
+            getattr(view, setter)(start if value is None else float(value))
+
+    def resume_holder(self, param):
+        if self.live:
+            self.resume(param.args[0].itemView)
+
+    def resume_all(self, param=None):
+        for view in list(self.live.keys()):
+            self.resume(view)
+
+
+class AddHook(MethodHook):
+    def __init__(self, plugin: MessageMotionPlugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        plugin = self.plugin
+        if plugin is None or not plugin.alive:
+            return
+        try:
+            plugin.prepare(param)
+        except Exception as error:
+            plugin.mode = None
+            plugin.log(f"Ошибка подготовки анимации: {error}")
+
+    def after_hooked_method(self, param):
+        plugin = self.plugin
+        if plugin is None or not plugin.alive:
+            return
+        try:
+            plugin.entered(param)
+        except Exception as error:
+            plugin.log(f"Ошибка анимации сообщения: {error}")
+
+
+class AfterHook(MethodHook):
+    def __init__(self, plugin: MessageMotionPlugin, callback):
+        super().__init__()
+        self.plugin = plugin
+        self.callback = callback
+
+    def after_hooked_method(self, param):
+        plugin = self.plugin
+        if plugin is None or not plugin.alive:
+            return
+        try:
+            self.callback(param)
+        except Exception as error:
+            plugin.log(f"Ошибка хука: {error}")
+
+
+class Finish(dynamic_proxy(Animator.AnimatorListener)):
+    def __init__(self, plugin: MessageMotionPlugin, view):
+        super().__init__()
+        self.plugin = plugin
+        self.view = view
+        self.done = False
+
+    def onAnimationStart(self, *args):
+        pass
+
+    def onAnimationRepeat(self, *args):
+        pass
+
+    def onAnimationCancel(self, *args):
+        pass
+
+    def onAnimationEnd(self, *args):
+        if self.done:
+            return
+        self.done = True
+        plugin = self.plugin
+        view = self.view
+        self.view = None
+        if plugin is None or view is None:
+            return
+        try:
+            plugin.finish(view, self)
+        except Exception as error:
+            plugin.log(f"Ошибка завершения анимации: {error}")
+
+
+class Waiter(dynamic_proxy(ViewTreeObserver.OnPreDrawListener)):
+    def __init__(self, plugin: MessageMotionPlugin, list_view):
+        super().__init__()
+        self.plugin = plugin
+        self.list_view = list_view
+
+    def onPreDraw(self):
+        plugin = self.plugin
+        list_view = self.list_view
+        if plugin is None or list_view is None or not plugin.alive:
+            return True
+        try:
+            if plugin.cascade(list_view):
+                plugin.disarm(self)
+        except Exception as error:
+            plugin.disarm(self)
+            plugin.log(f"Ошибка каскада: {error}")
+        return True
+
+
+class Tracker(dynamic_proxy(RecyclerView.OnChildAttachStateChangeListener, ViewTreeObserver.OnPreDrawListener)):
+    def __init__(self, plugin: MessageMotionPlugin, chat, list_view):
+        super().__init__()
+        self.plugin = plugin
+        self.chat = chat
+        self.list_view = list_view
+        self.pending = {}
+        self.observer = None
+
+    def onChildViewAttachedToWindow(self, view):
+        plugin = self.plugin
+        if plugin is None or not plugin.alive:
+            return
+        try:
+            plugin.spotted(self, view)
+        except Exception as error:
+            plugin.log(f"Ошибка прокрутки: {error}")
+
+    def onChildViewDetachedFromWindow(self, view):
+        self.pending.pop(view, None)
+        plugin = self.plugin
+        if plugin is None or view not in plugin.live:
+            return
+        try:
+            plugin.stop(view)
+        except Exception as error:
+            plugin.log(f"Ошибка прокрутки: {error}")
+
+    def onPreDraw(self):
+        plugin = self.plugin
+        if plugin is None or not plugin.alive:
+            self.disarm()
+            return True
+        try:
+            plugin.reveal(self)
+        except Exception as error:
+            self.pending.clear()
+            self.disarm()
+            plugin.log(f"Ошибка прокрутки: {error}")
+        return True
+
+    def arm(self):
+        if self.observer is not None:
+            return
+        observer = self.list_view.getViewTreeObserver()
+        observer.addOnPreDrawListener(self)
+        self.observer = observer
+
+    def disarm(self):
+        observer = self.observer
+        self.observer = None
+        if observer is None:
+            return
+        try:
+            if observer.isAlive():
+                observer.removeOnPreDrawListener(self)
+        except Exception:
+            pass
