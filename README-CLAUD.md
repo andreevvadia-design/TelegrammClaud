@@ -1,5 +1,8 @@
 # claud mode for Android
 
+[Telegram: новости claud mode](https://t.me/telegaClaudMod)
+
+
 Personal Telegram Android fork with plugin settings, profile customization and the Claude companion. Based on Telegram for Android; upstream license and copyright notices are retained.
 
 ## Build
