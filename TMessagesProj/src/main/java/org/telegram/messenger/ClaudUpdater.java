@@ -25,9 +25,8 @@ public final class ClaudUpdater {
         lastCheck=System.currentTimeMillis();
         new Thread(() -> {try{
             JSONObject release=new JSONObject(new String(fetch(API,1048576),java.nio.charset.StandardCharsets.UTF_8));
-            JSONArray assets=release.getJSONArray("assets");String url=null;long size=0;int version=0;
-            for(int i=0;i<assets.length();i++){JSONObject asset=assets.getJSONObject(i);String name=asset.getString("name");
-                if(name.matches("claud-mode-arm64-[0-9]+\\.apk")){version=Integer.parseInt(name.substring(17,name.length()-4));url=asset.getString("browser_download_url");size=asset.getLong("size");break;}}
+            ClaudReleaseAsset asset=ClaudReleaseAsset.select(release);
+            String url=asset==null?null:asset.url;long size=asset==null?0:asset.size;int version=asset==null?0:asset.version;
             long installed=Build.VERSION.SDK_INT>=28?a.getPackageManager().getPackageInfo(a.getPackageName(),0).getLongVersionCode():a.getPackageManager().getPackageInfo(a.getPackageName(),0).versionCode;
             if(url==null||version<=installed){if(manual)message(a,"Обновлений пока нет");return;}
             final String download=url;final long expected=size;

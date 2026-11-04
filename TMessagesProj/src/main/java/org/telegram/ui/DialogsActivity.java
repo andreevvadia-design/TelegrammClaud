@@ -13674,6 +13674,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
 
     private void showItemOptions() {
         ItemOptions io = ItemOptions.makeOptions(this, optionsItem);
+        if(communityId==0 && !isArchive()) {
+            io.add(R.drawable.msg_message, "claud music", () -> presentFragment(new ClaudMusicActivity()));
+            io.addGap();
+        }
         io.setColors(getThemedColor(Theme.key_actionBarDefaultTitle), getThemedColor(Theme.key_actionBarDefaultTitle));
         io.setDimAlpha(0x08);
 

@@ -1554,6 +1554,13 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                 return false;
             }
         }
+        if ("app.claud.OPEN_SOUNDCLOUD_PLAYER".equals(action) && UserConfig.getInstance(currentAccount).isClientActivated()) {
+            if (getActionBarLayout().getLastFragment() instanceof ClaudSoundCloudPlayerActivity) return true;
+            if (getActionBarLayout().getLastFragment() == null) presentFragment(new DialogsActivity(null));
+            presentFragment(new ClaudSoundCloudPlayerActivity());
+            intent.setAction(Intent.ACTION_MAIN);
+            return true;
+        }
         boolean pushOpened = false;
         long push_user_id = 0;
         long push_chat_id = 0;

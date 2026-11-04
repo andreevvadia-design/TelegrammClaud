@@ -2873,6 +2873,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         final ItemOptions o = ItemOptions.makeOptions(container, resourcesProvider, v, true);
+        o.add(R.drawable.msg_message, "Текст песни", () -> {o.dismiss();ClaudLyrics.show(parentActivity,messageObject);});
         ItemOptions o2 = buildSaveOptions(o, messageObject);
         if (!isMyList()) {
             o.addIf(!noforwards, R.drawable.msg_stories_save, getString(R.string.AudioSaveTo), () -> o.openSwipeback(o2));

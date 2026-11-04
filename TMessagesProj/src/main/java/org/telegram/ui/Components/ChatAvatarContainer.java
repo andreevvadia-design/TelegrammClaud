@@ -937,6 +937,7 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
     }
 
     public void setTitle(CharSequence value, boolean scam, boolean fake, boolean verified, boolean premium, TLRPC.EmojiStatus emojiStatus, boolean animated) {
+        if(parentFragment!=null && value!=null){int streak=org.telegram.messenger.ClaudStreaks.count(currentAccount,parentFragment.getDialogId());if(streak>0)value=value+"  🔥 "+streak;}
         if (value != null) {
             value = Emoji.replaceEmoji(value, titleTextView.getPaint().getFontMetricsInt(), false);
         }

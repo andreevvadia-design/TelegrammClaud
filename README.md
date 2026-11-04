@@ -1,10 +1,19 @@
-## Telegram messenger for Android
+# ClaudMod
 
-[Telegram: новости claud mode](https://t.me/telegaClaudMod)
+Неофициальный Telegram-клиент для Android с музыкой SoundCloud, плагинами и питомцем Клодом. Основан на открытом исходном коде Telegram.
 
+[Скачать claud-mode.apk](https://github.com/andreevvadia-design/TelegrammClaud/releases/latest/download/claud-mode.apk) · [Telegram-канал](https://t.me/telegaClaudMod)
 
-[Telegram](https://telegram.org) is a messaging app with a focus on speed and security. It’s superfast, simple and free.
-This repo contains the official source code for [Telegram App for Android](https://play.google.com/store/apps/details?id=org.telegram.messenger).
+## Музыкальное обновление
+
+- Единый поиск треков, публичных плейлистов и артистов SoundCloud.
+- Плеер, очередь, избранное и управление из уведомления.
+- Свои плейлисты, сохранение публичных подборок, профили артистов и подписки внутри клиента.
+- Новый интерфейс музыкального раздела и имя приложения ClaudMod.
+
+Свои плейлисты и подписки хранятся внутри клиента и не синхронизируются с аккаунтом SoundCloud. Доступность аудио определяется SoundCloud. Публичные общие чарты пользователей ClaudMod пока не реализованы.
+
+Для запуска собственной сборки укажите свои Telegram API ID/Hash и сервисные конфигурации. Ключи подписи и локальные настройки не входят в репозиторий. APK размещаются в Releases.
 
 ## Creating your Telegram Application
 

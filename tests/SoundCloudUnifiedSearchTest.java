@@ -1,0 +1,5 @@
+package org.telegram.messenger.music;
+import org.json.*;
+public class SoundCloudUnifiedSearchTest{public static void main(String[] args)throws Exception{
+ JSONObject data=new JSONObject("{\"collection\":[{\"kind\":\"user\",\"id\":1},{\"kind\":\"track\",\"id\":1,\"streamable\":true},{\"kind\":\"playlist\",\"id\":1},{\"kind\":\"track\",\"id\":2,\"streamable\":false}],\"next_href\":\"https://api-v2.soundcloud.com/search?offset=50\"}");
+ SoundCloudPublic.CatalogPage p=SoundCloudPublic.parseCatalog(data,"/search");if(p.items.size()!=3||!(p.items.get(0) instanceof SoundCloudPublic.Artist)||!(p.items.get(1) instanceof SoundCloudPublic.Track)||!(p.items.get(2) instanceof SoundCloudPublic.Playlist))throw new AssertionError("Provider ranking/types lost");if(p.next==null)throw new AssertionError("Lost cursor");boolean rejected=false;try{SoundCloudPublic.catalogCursor("https://api-v2.soundcloud.com/search/users?offset=50","/search");}catch(Exception e){rejected=true;}if(!rejected)throw new AssertionError("Wrong cursor route");System.out.println("Unified search order, typed results, unavailable filtering and cursor tests passed.");}}

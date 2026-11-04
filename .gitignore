@@ -41,3 +41,6 @@ release-update/
 .env
 .env.*
 TMessagesProj_App/src/debug/google-services.json
+
+# Public CA certificates used by vendored certifi
+!TMessagesProj/src/main/python/certifi/cacert.pem

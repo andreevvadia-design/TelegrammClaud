@@ -28,6 +28,7 @@ public final class ClaudModeSettingsActivity extends BaseFragment {
         ScrollView scroll=new ScrollView(c); scroll.setFillViewport(true); scroll.setBackgroundColor(0xFF211F1D);
         LinearLayout box=new LinearLayout(c); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(dp(20),dp(24),dp(20),dp(30)); scroll.addView(box);
         TextView heading=new TextView(c); heading.setText("Твой claud mode"); heading.setTextSize(27); heading.setTextColor(0xFFF2E6DC); heading.setTypeface(AndroidUtilities.bold()); heading.setPadding(0,0,0,dp(24)); box.addView(heading);
+        row(box,"claud music","Твоя музыка, рекомендации и плейлисты",() -> presentFragment(new ClaudMusicActivity()));
         row(box,"Обновления","Проверить новую версию claud mode",() -> org.telegram.messenger.ClaudUpdater.check(getParentActivity(),true));
         row(box,"Плагины","Установка, управление и настройки расширений",() -> presentFragment(new ClaudPluginsActivity()));
         row(box,"Уведомления","Разрешение, проверка и восстановление доставки",() -> presentFragment(new ClaudNotificationsActivity()));
